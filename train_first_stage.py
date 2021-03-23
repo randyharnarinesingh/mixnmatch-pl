@@ -121,7 +121,7 @@ def save_opt(optimizerGE, optimizerD0, optimizerD2, optimizerBD, epoch, opt_dir)
 ############################### Trainer ############################
 
 
-class Trainer(pl.LightningModule):
+class Stage1(pl.LightningModule):
     def __init__(
         self,
         netG: nn.Module,
@@ -130,6 +130,7 @@ class Trainer(pl.LightningModule):
         encoder: nn.Module,
         output_dir,
     ):
+        super().__init__()
 
         # prepare net, optimizer and loss
         self.netG, self.netsD, self.BD, self.encoder = [netG, netsD, BD, encoder]
@@ -159,6 +160,7 @@ class Trainer(pl.LightningModule):
 
         # maintaining an epoch variable to pass to different save data functions
         self.epoch = 0
+        self.batch_loaded = 0
 
     def train_dataloader(self):
         dl = get_dataloader()
@@ -206,6 +208,7 @@ class Trainer(pl.LightningModule):
         real_c = real_c.to(device)
         real_b = real_c
 
+        self.batch_loaded = 1
         return real_img126, real_img, real_z, real_b, real_p, real_c, warped_bbox
 
     def train_Dnet(self, idx):
@@ -331,8 +334,6 @@ class Trainer(pl.LightningModule):
 
     def train_BD(self):
 
-        self.optimizerBD.zero_grad()
-
         # make prediction on pairs
         pred_enc_z, pred_enc_b, pred_enc_p, pred_enc_c = self.BD(
             self.real_img,
@@ -386,8 +387,6 @@ class Trainer(pl.LightningModule):
         return D_loss
 
     def train_EG(self):
-
-        self.optimizerGE.zero_grad()
 
         # reconstruct code and calculate loss
         self.rec_p, _ = self.netsD[1](self.fg_mk[0])
@@ -452,48 +451,72 @@ class Trainer(pl.LightningModule):
 
         return EG_loss
 
-    def training_step(self, batch, batch_idx):
+    def training_step(self, batch, batch_idx, optimizer_idx):
 
-        # prepare data
-        (
-            self.real_img126,
-            self.real_img,
-            self.real_z,
-            self.real_b,
-            self.real_p,
-            self.real_c,
-            self.warped_bbox,
-        ) = self.prepare_data(batch)
+        if not self.batch_loaded:
+            # prepare data
+            (
+                self.real_img126,
+                self.real_img,
+                self.real_z,
+                self.real_b,
+                self.real_p,
+                self.real_c,
+                self.warped_bbox,
+            ) = self.prepare_data(batch)
 
-        # forward for both E and G
-        self.fake_z, self.fake_b, self.fake_p, self.fake_c = self.encoder(
-            self.real_img, "softmax"
-        )
-        self.fake_imgs, self.fg_imgs, self.mk_imgs, self.fg_mk = self.netG(
-            self.real_z, self.real_c, self.real_p, self.real_b, "code"
-        )
+            # forward for both E and G
+            self.fake_z, self.fake_b, self.fake_p, self.fake_c = self.encoder(
+                self.real_img, "softmax"
+            )
+            self.fake_imgs, self.fg_imgs, self.mk_imgs, self.fg_mk = self.netG(
+                self.real_z, self.real_c, self.real_p, self.real_b, "code"
+            )
 
         # Update Discriminator networks in FineGAN
-        d_loss0 = self.train_Dnet(0)
-        d_loss2 = self.train_Dnet(2)
+        if optimizer_idx == 0:
+            loss = self.train_Dnet(0)
+
+        if optimizer_idx == 1:
+            loss = self.train_Dnet(2)
 
         # Update Bi Discriminator
-        bd_loss = self.train_BD()
+        if optimizer_idx == 2:
+            loss = self.train_BD()
 
         # Update Encoder and G network
-        self.train_EG()
-        for avg_p, p in zip(self.avg_param_G, self.netG.parameters()):
-            avg_p.mul_(0.999).add_(0.001, p.data)
+        if optimizer_idx == 3:
+            loss = self.train_EG()
 
-        # Save model&image for each epoch
-        backup_para = copy_G_params(self.netG)
-        load_params(self.netG, self.avg_param_G)
+            for avg_p, p in zip(self.avg_param_G, self.netG.parameters()):
+                avg_p.mul_(0.999).add_(0.001, p.data)
 
-        ############################################
-        # training_step needs to return at least the loss
-        ############################################
+            # Save model&image for each epoch
+            backup_para = copy_G_params(self.netG)
+            load_params(self.netG, self.avg_param_G)
+            save_model(
+                self.encoder,
+                self.netG,
+                self.netsD[0],
+                self.netsD[1],
+                self.netsD[2],
+                self.BD,
+                0,
+                self.model_dir,
+            )
+            save_opt(
+                self.optimizerGE,
+                self.optimizersD[0],
+                self.optimizersD[2],
+                self.optimizerBD,
+                0,
+                self.opt_dir,
+            )
+            load_params(self.netG, backup_para)
 
-        # return loss
+            self.batch_loaded = 0
+
+        return loss
 
     def validation_step(self):
         self.code_z, self.code_b, self.code_p, self.code_c = self.encoder(
@@ -539,4 +562,25 @@ class Trainer(pl.LightningModule):
             self.netG, self.netsD, self.BD, self.encoder
         )
 
-        return [optimizersD, optimizerBD, optimizerGE], []
+        return optimizersD, optimizersD, optimizerBD, optimizerGE
+
+
+if __name__ == "__main__":
+
+    manualSeed = random.randint(1, 10000)
+    random.seed(manualSeed)
+    torch.manual_seed(manualSeed)
+    torch.cuda.manual_seed_all(manualSeed)
+
+    # prepare output folder for this running and save all files
+    output_dir = make_output_dir()
+    shutil.copy2(sys.argv[0], output_dir)
+    shutil.copy2("model_train.py", output_dir)
+    shutil.copy2("config.py", output_dir)
+    shutil.copy2("utils.py", output_dir)
+    shutil.copy2("datasets.py", output_dir)
+
+    model_args = load_network() + (output_dir,)
+    stage1 = Stage1(*model_args)
+
+    # define trainer here, and train without any dataloaders
